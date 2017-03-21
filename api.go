@@ -41,16 +41,28 @@ var sPort *string
 var eHost *string
 var ePort *string
 
+var client *elastic.Client
+var err error
+
 var (
-	reqQtty = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name:  "qtty_reqs_counter",
-		Help: "Total Requests Count",
+	reqQttyStatus200 = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name:  "qtty_reqs_counter_status_200",
+		Help: "Total 200 Requests Count",
+	})
+	reqQttyStatus400 = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name:  "qtty_reqs_counter_status_400",
+		Help: "Total 400 Requests Count",
+	})
+	reqQttyStatus500 = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name:  "qtty_reqs_counter_status_500",
+		Help: "Total 500 Requests Count",
 	})
 )
 
 func init() {
-	// Metrics have to be registered to be exposed:
-	prometheus.MustRegister(reqQtty)
+	prometheus.MustRegister(reqQttyStatus200)
+	prometheus.MustRegister(reqQttyStatus400)
+	prometheus.MustRegister(reqQttyStatus500)
 }
 
 func main() {
@@ -62,69 +74,14 @@ func main() {
 
 	flag.Parse()
 
-	// Create a context
-	ctx := context.Background()
+	reqQttyStatus200.Set(0)
+	reqQttyStatus400.Set(0)
+	reqQttyStatus500.Set(0)
 
-	// Create a client
-	client, err := elastic.NewClient(elastic.SetSniff(false), elastic.SetURL("http://" + *eHost + ":" + *ePort))
+	client, err = elastic.NewClient(elastic.SetSniff(false), elastic.SetURL("http://" + *eHost + ":" + *ePort))
 	if err != nil {
-		// Handle error
 		panic(err)
 	}
-
-	exists, err := client.IndexExists("metrics").Do(ctx)
-	if err != nil {
-		// Handle error
-		panic(err)
-	}
-	if !exists {
-		// Create an index
-		_, err = client.CreateIndex("metrics").Do(ctx)
-		if err != nil {
-			// Handle error
-			panic(err)
-		}
-	}
-	// Search with a term query
-	searchResult, err := client.Search().
-		Index("metrics").// search in index "twitter"
-		From(0).// take documents 0-9
-		Pretty(true).// pretty print request and response JSON
-		Do(ctx)             // execute
-	if err != nil {
-		// Handle error
-		panic(err)
-	}
-
-	// searchResult is of type SearchResult and returns hits, suggestions,
-	// and all kinds of other information from Elasticsearch.
-	fmt.Printf("Query took %d milliseconds\n", searchResult.TookInMillis)
-
-	// Here's how you iterate through results with full control over each step.
-	if searchResult.Hits.TotalHits > 0 {
-		fmt.Printf("Found a total of %d metrics\n", searchResult.Hits.TotalHits)
-
-		// Iterate through results
-		for _, hit := range searchResult.Hits.Hits {
-			// hit.Index contains the name of the index
-
-			// Deserialize hit.Source into a Tweet (could also be just a map[string]interface{}).
-			var t Metric
-			err := json.Unmarshal(*hit.Source, &t)
-			if err != nil {
-				// Deserialization failed
-			}
-			t.ID = hit.Id
-			metrics = append(metrics, t)
-		}
-	} else {
-		// No hits
-		fmt.Print("Found no metric\n")
-	}
-	reqQtty.Set(0)
-
-	// The Handler function provides a default handler to expose metrics
-	// via an HTTP server. "/metrics" is the usual endpoint for that.
 
 	router := mux.NewRouter()
 	router.HandleFunc("/metrics", HandleProme)
@@ -136,27 +93,15 @@ func main() {
 
 func HandleProme(w http.ResponseWriter, req *http.Request) {
 
-	fmt.Println("Teste")
-	// Create a context
 	ctx := context.Background()
-
-	// Create a client
-	client, err := elastic.NewClient(elastic.SetSniff(false), elastic.SetURL("http://" + *eHost + ":" + *ePort))
-	if err != nil {
-		// Handle error
-		panic(err)
-	}
 
 	exists, err := client.IndexExists("metrics").Do(ctx)
 	if err != nil {
-		// Handle error
 		panic(err)
 	}
 	if !exists {
-		// Create an index
 		_, err = client.CreateIndex("metrics").Do(ctx)
 		if err != nil {
-			// Handle error
 			panic(err)
 		}
 	}
@@ -168,51 +113,84 @@ func HandleProme(w http.ResponseWriter, req *http.Request) {
 	fmt.Println("Current: " + current.Format("20060102150405"))
 	fmt.Println("Next:    " + next.Format("20060102150405"))
 
-	q := elastic.NewRangeQuery("Datetime").
-		Format("yyyyMMddHHmmss").
-		From(current.Format("20060102150405")).
-		To(next.Format("20060102150405"))
+	query := `
+	{
+	    "bool": {
+		"must": [
+		    {
+		        "range": {
+			    "Datetime": {
+			       "format": "yyyyMMddHHmmss",
+			       "from": "%s",
+			       "to": "%s"
+			    }
+		        }
+		    },
+		    {
+		        "range": {
+			    "ResponseHeaders.status": {
+			       "from": %d,
+			       "to": %d
+			   }
+		        }
+		    }
+		]
+	    }
+  	 }`
 
-	q = q.QueryName("my_query")
-
-	// Search with a term query
-	searchResult, err := client.Search().
-		Query(q).
-		Index("metrics").// search in index "twitter"
-		From(0).// take documents 0-9
-		Pretty(true).// pretty print request and response JSON
-		Do(ctx)             // execute
+	rawQuery200 := elastic.NewRawStringQuery(fmt.Sprintf(query, current.Format("20060102150405"), next.Format("20060102150405"), 200, 299))
+	searchResult200, err := client.Search().
+		Query(rawQuery200).
+		Index("metrics").
+		Pretty(true).
+		Do(ctx)
 	if err != nil {
-		// Handle error
 		panic(err)
 	}
 
-	// searchResult is of type SearchResult and returns hits, suggestions,
-	// and all kinds of other information from Elasticsearch.
-	fmt.Printf("Query took %d milliseconds\n", searchResult.TookInMillis)
-
-	// Here's how you iterate through results with full control over each step.
-	if searchResult.Hits.TotalHits > 0 {
-		fmt.Printf("Found a total of %d metrics\n", searchResult.Hits.TotalHits)
-
-		// Iterate through results
-		for _, hit := range searchResult.Hits.Hits {
-			// hit.Index contains the name of the index
-
-			// Deserialize hit.Source into a Tweet (could also be just a map[string]interface{}).
-			var t Metric
-			err := json.Unmarshal(*hit.Source, &t)
-			if err != nil {
-				// Deserialization failed
-			}
-			t.ID = hit.Id
-			metrics = append(metrics, t)
-		}
+	if searchResult200.Hits.TotalHits > 0 {
+		reqQttyStatus200.Set(float64(searchResult200.Hits.TotalHits))
+		fmt.Printf("Total 200: %d", searchResult200.Hits.TotalHits)
+		fmt.Println()
 	} else {
-		// No hits
-		fmt.Print("Found no metric\n")
+		reqQttyStatus200.Set(0)
 	}
-	reqQtty.Set(float64(searchResult.Hits.TotalHits))
+
+	rawQuery400 := elastic.NewRawStringQuery(fmt.Sprintf(query, current.Format("20060102150405"), next.Format("20060102150405"), 400, 500))
+	searchResult400, err := client.Search().
+		Query(rawQuery400).
+		Index("metrics").
+		Pretty(true).
+		Do(ctx)
+	if err != nil {
+		panic(err)
+	}
+
+	if searchResult400.Hits.TotalHits > 0 {
+		reqQttyStatus400.Set(float64(searchResult400.Hits.TotalHits))
+		fmt.Printf("Total 400: %d", searchResult400.Hits.TotalHits)
+		fmt.Println()
+	} else {
+		reqQttyStatus400.Set(0)
+	}
+
+	rawQuery500 := elastic.NewRawStringQuery(fmt.Sprintf(query, current.Format("20060102150405"), next.Format("20060102150405"), 500, 999))
+	searchResult500, err := client.Search().
+		Query(rawQuery500).
+		Index("metrics").
+		Pretty(true).
+		Do(ctx)
+	if err != nil {
+		panic(err)
+	}
+
+	if searchResult500.Hits.TotalHits > 0 {
+		reqQttyStatus500.Set(float64(searchResult500.Hits.TotalHits))
+		fmt.Printf("Total 500: %d", searchResult500.Hits.TotalHits)
+		fmt.Println()
+	} else {
+		reqQttyStatus500.Set(0)
+	}
 
 	promhttp.Handler().ServeHTTP(w, req)
 
@@ -232,28 +210,15 @@ func CreateMetricEndpoint(w http.ResponseWriter, req *http.Request) {
 	metric.ID = params["id"]
 	metric.Datetime = current_time.Format("20060102150405")
 	metrics = append(metrics, metric)
-	//json.NewEncoder(w).Encode(metrics)
-
-	// Create a context
 	ctx := context.Background()
-
-	// Create a client
-	client, err := elastic.NewClient(elastic.SetSniff(false), elastic.SetURL("http://" + *eHost + ":" + *ePort))
-	if err != nil {
-		// Handle error
-		panic(err)
-	}
 
 	exists, err := client.IndexExists("metrics").Do(ctx)
 	if err != nil {
-		// Handle error
 		panic(err)
 	}
 	if !exists {
-		// Create an index
 		_, err = client.CreateIndex("metrics").Do(ctx)
 		if err != nil {
-			// Handle error
 			panic(err)
 		}
 	}
@@ -265,61 +230,6 @@ func CreateMetricEndpoint(w http.ResponseWriter, req *http.Request) {
 		Do(context.Background())
 
 	if err != nil {
-		// Handle error
 		panic(err)
 	}
-
-	seconds := 10
-	current := time.Now().Local().Add(time.Duration(-10) * time.Second)
-	next := time.Now().Local().Add(time.Duration(seconds) * time.Second)
-
-	fmt.Println("Current: " + current.Format("20060102150405"))
-	fmt.Println("Next:    " + next.Format("20060102150405"))
-
-	q := elastic.NewRangeQuery("Datetime").
-		Format("yyyyMMddHHmmss").
-		From(current.Format("20060102150405")).
-		To(next.Format("20060102150405"))
-
-	q = q.QueryName("my_query")
-
-	// Search with a term query
-	searchResult, err := client.Search().
-		Query(q).
-		Index("metrics").// search in index "twitter"
-		From(0).// take documents 0-9
-		Pretty(true).// pretty print request and response JSON
-		Do(ctx)             // execute
-	if err != nil {
-		// Handle error
-		panic(err)
-	}
-
-	// searchResult is of type SearchResult and returns hits, suggestions,
-	// and all kinds of other information from Elasticsearch.
-	fmt.Printf("Query took %d milliseconds\n", searchResult.TookInMillis)
-
-	// Here's how you iterate through results with full control over each step.
-	if searchResult.Hits.TotalHits > 0 {
-		fmt.Printf("Found a total of %d metrics\n", searchResult.Hits.TotalHits)
-
-		// Iterate through results
-		for _, hit := range searchResult.Hits.Hits {
-			// hit.Index contains the name of the index
-
-			// Deserialize hit.Source into a Tweet (could also be just a map[string]interface{}).
-			var t Metric
-			err := json.Unmarshal(*hit.Source, &t)
-			if err != nil {
-				// Deserialization failed
-			}
-			t.ID = hit.Id
-			metrics = append(metrics, t)
-		}
-	} else {
-		// No hits
-		fmt.Print("Found no metric\n")
-	}
-	//reqQtty.Inc()
-	reqQtty.Set(float64(searchResult.Hits.TotalHits))
 }

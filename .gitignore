@@ -24,4 +24,4 @@ _testmain.go
 *.prof
 .idea
 api
-request.json
+nohup.out
