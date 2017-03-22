@@ -12,12 +12,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"time"
+	"strconv"
 )
 
 type Metric struct {
 	ID              string   `json:"id,omitempty"`
 	Url             string   `json:"url,omitempty"`
 	Origin          string   `json:"origin,omitempty"`
+	Dest            string   `json:"destino,omitempty"`
 	Time            string   `json:"time,omitempty"`
 	RequestHeaders  RequestHeaders
 	ResponseHeaders ResponseHeaders
@@ -57,12 +59,18 @@ var (
 		Name:  "qtty_reqs_counter_status_500",
 		Help: "Total 500 Requests Count",
 	})
+
+	reqCountByDest = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name:      "qtty_reqs_counter",
+		Help:      "Requests by Dest",
+	}, []string{"destino", "status"})
 )
 
 func init() {
 	prometheus.MustRegister(reqQttyStatus200)
 	prometheus.MustRegister(reqQttyStatus400)
 	prometheus.MustRegister(reqQttyStatus500)
+	prometheus.MustRegister(reqCountByDest)
 }
 
 func main() {
@@ -85,10 +93,44 @@ func main() {
 
 	router := mux.NewRouter()
 	router.HandleFunc("/metrics", HandleProme)
-	router.HandleFunc("/metrics/all", GetMetricsEndpoint).Methods("GET")
 	router.HandleFunc("/metrics/create", CreateMetricEndpoint).Methods("POST")
 	fmt.Println("Server Running: ", *sHost + ":" + *sPort)
 	log.Fatal(http.ListenAndServe(*sHost + ":" + *sPort, router))
+}
+
+func SearchKeyToCounter(current string, next string, status_start int, status_end int) {
+	fmt.Println("----------------------------------------------")
+	timeline := elastic.NewTermsAggregation().Field("destino.keyword")
+	searchResult, err := client.Search().
+		Index("metrics").
+		Query(elastic.NewMatchAllQuery()).
+		Size(0).
+		Aggregation("destinos", timeline).
+		Pretty(true).
+		Do(context.Background())
+	if err != nil {
+		panic(err)
+	}
+
+	agg, found := searchResult.Aggregations.Terms("destinos")
+
+	if !found {
+		log.Fatalf("we should have a terms aggregation called %q", "timeline")
+	}
+	var t string
+
+	if status_start == 0{
+		t = "Total";
+	}else{
+		t = strconv.Itoa(status_start)
+	}
+
+	fmt.Println(t)
+
+	for _, dest := range agg.Buckets {
+		dest := dest.Key.(string)
+		reqCountByDest.WithLabelValues(dest, t).Set(GetMetricsByDest(dest, current, next, status_start, status_end))
+	}
 }
 
 func HandleProme(w http.ResponseWriter, req *http.Request) {
@@ -107,11 +149,11 @@ func HandleProme(w http.ResponseWriter, req *http.Request) {
 	}
 
 	seconds := 10
-	current := time.Now().Local().Add(time.Duration(-10) * time.Second)
-	next := time.Now().Local().Add(time.Duration(seconds) * time.Second)
+	current := time.Now().Local().Add(time.Duration(-10) * time.Second).Format("20060102150405")
+	next := time.Now().Local().Add(time.Duration(seconds) * time.Second).Format("20060102150405")
 
-	fmt.Println("Current: " + current.Format("20060102150405"))
-	fmt.Println("Next:    " + next.Format("20060102150405"))
+	fmt.Println("Current: " + current)
+	fmt.Println("Next:    " + next)
 
 	query := `
 	{
@@ -136,9 +178,9 @@ func HandleProme(w http.ResponseWriter, req *http.Request) {
 		    }
 		]
 	    }
-  	 }`
+  	}`
 
-	rawQuery200 := elastic.NewRawStringQuery(fmt.Sprintf(query, current.Format("20060102150405"), next.Format("20060102150405"), 200, 299))
+	rawQuery200 := elastic.NewRawStringQuery(fmt.Sprintf(query, current, next, 200, 299))
 	searchResult200, err := client.Search().
 		Query(rawQuery200).
 		Index("metrics").
@@ -148,15 +190,10 @@ func HandleProme(w http.ResponseWriter, req *http.Request) {
 		panic(err)
 	}
 
-	if searchResult200.Hits.TotalHits > 0 {
-		reqQttyStatus200.Set(float64(searchResult200.Hits.TotalHits))
-		fmt.Printf("Total 200: %d", searchResult200.Hits.TotalHits)
-		fmt.Println()
-	} else {
-		reqQttyStatus200.Set(0)
-	}
+	SearchKeyToCounter(current, next, 200, 299)
+	reqQttyStatus200.Set(float64(searchResult200.Hits.TotalHits))
 
-	rawQuery400 := elastic.NewRawStringQuery(fmt.Sprintf(query, current.Format("20060102150405"), next.Format("20060102150405"), 400, 500))
+	rawQuery400 := elastic.NewRawStringQuery(fmt.Sprintf(query, current, next, 400, 499))
 	searchResult400, err := client.Search().
 		Query(rawQuery400).
 		Index("metrics").
@@ -166,15 +203,10 @@ func HandleProme(w http.ResponseWriter, req *http.Request) {
 		panic(err)
 	}
 
-	if searchResult400.Hits.TotalHits > 0 {
-		reqQttyStatus400.Set(float64(searchResult400.Hits.TotalHits))
-		fmt.Printf("Total 400: %d", searchResult400.Hits.TotalHits)
-		fmt.Println()
-	} else {
-		reqQttyStatus400.Set(0)
-	}
+	SearchKeyToCounter(current, next, 400, 499)
+	reqQttyStatus400.Set(float64(searchResult400.Hits.TotalHits))
 
-	rawQuery500 := elastic.NewRawStringQuery(fmt.Sprintf(query, current.Format("20060102150405"), next.Format("20060102150405"), 500, 999))
+	rawQuery500 := elastic.NewRawStringQuery(fmt.Sprintf(query, current, next, 500, 999))
 	searchResult500, err := client.Search().
 		Query(rawQuery500).
 		Index("metrics").
@@ -184,21 +216,59 @@ func HandleProme(w http.ResponseWriter, req *http.Request) {
 		panic(err)
 	}
 
-	if searchResult500.Hits.TotalHits > 0 {
-		reqQttyStatus500.Set(float64(searchResult500.Hits.TotalHits))
-		fmt.Printf("Total 500: %d", searchResult500.Hits.TotalHits)
-		fmt.Println()
-	} else {
-		reqQttyStatus500.Set(0)
-	}
+	SearchKeyToCounter(current, next, 500, 999)
+	reqQttyStatus500.Set(float64(searchResult500.Hits.TotalHits))
+
+	SearchKeyToCounter(current, next, 0, 999)
 
 	promhttp.Handler().ServeHTTP(w, req)
-
 }
 
-func GetMetricsEndpoint(w http.ResponseWriter, req *http.Request) {
-	//log.Print("New Request" + req.URL.String())
-	//json.NewEncoder(w).Encode(metrics)
+func GetMetricsByDest(dest string, current string, next string, status_start int, status_end int) float64 {
+	query := `
+	{
+	    "bool": {
+		"must": [
+		    {
+			"term": {
+			    "destino": {
+				"value": "%s"
+			    }
+			}
+            	    },
+		    {
+		        "range": {
+			    "Datetime": {
+			       "format": "yyyyMMddHHmmss",
+			       "from": "%s",
+			       "to": "%s"
+			    }
+		        }
+		    },
+		    {
+		        "range": {
+			    "ResponseHeaders.status": {
+			       "from": %d,
+			       "to": %d
+			   }
+		        }
+		    }
+		]
+	    }
+  	}`
+
+	rawQuery := elastic.NewRawStringQuery(fmt.Sprintf(query, dest, current, next, status_start, status_end))
+
+	searchResult, err := client.Search().
+		Query(rawQuery).
+		Index("metrics").
+		Pretty(true).
+		Do(context.Background())
+	if err != nil {
+		panic(err)
+	}
+
+	return float64(searchResult.Hits.TotalHits)
 }
 
 func CreateMetricEndpoint(w http.ResponseWriter, req *http.Request) {
